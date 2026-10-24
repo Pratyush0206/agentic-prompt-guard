@@ -402,6 +402,11 @@ _RULES: list[tuple[str, ThreatType, str]] = [
      ThreatType.MISLEADING_CLAIM, "targets a sales outcome without approved claims constraint"),
     (r"(catchy|social media|viral|marketing)\s+(post|content|campaign|copy|message|ad)",
      ThreatType.MISLEADING_CLAIM, "promotional content without approved indications/safety warnings"),
+    # P1-6: "catchy social post" (no "media" between "social" and "post") wasn't
+    # covered by the rule above, which requires its trigger word and object to
+    # be adjacent — this is the literal README example prompt.
+    (r"catchy\s+social\s+(media\s+)?post",
+     ThreatType.MISLEADING_CLAIM, "promotional social post without approved indications/safety warnings"),
     (r"(?<!non-)promotional\s+(post|content|campaign|copy|material|message|ad)",
      ThreatType.MISLEADING_CLAIM, "promotional content without approved indications/safety warnings"),
     (r"\b(pitch|outreach)\b.{0,30}\b(drug|biologic|brand|product|therapy|treatment)\b",
@@ -831,7 +836,13 @@ _RULES: list[tuple[str, ThreatType, str]] = [
     # ── Credential access / secret extraction ────────────────────────────────
     (r"(reveal|print|show|output|display|echo|leak|extract|dump|exfiltrate|give me|return|retrieve|fetch|get|read|access).{0,30}(api[ _-]?key|apikey|secret|token|password|credential|env var|environment variable|system prompt|hidden prompt|initial prompt)",
      ThreatType.CREDENTIAL_ACCESS, "credential or secret extraction attempt"),
-    (r"(what is|what are|tell me).{0,30}(the )?(api[ _-]?key|apikey|secret[ _-]?key|access[ _-]?token|auth[ _-]?token|master[ _-]?key|admin[ _-]?password)",
+    # Requires the definite article ("the") so this only matches a query for
+    # an actual secret value ("what is the api key") and not a definitional
+    # question ("what is an api key") — see credential_extraction_score's
+    # own educational carve-out in guard/heuristics.py, which this rule must
+    # not re-introduce a false positive around now that the rule scan always
+    # runs (P1-3 removed the whitelist override that used to mask this).
+    (r"(what is|what are|tell me).{0,30}the (api[ _-]?key|apikey|secret[ _-]?key|access[ _-]?token|auth[ _-]?token|master[ _-]?key|admin[ _-]?password)",
      ThreatType.CREDENTIAL_ACCESS, "direct query for secret keys or credentials"),
     (r"(retrieve|get|read|fetch|access|extract).{0,40}(stored in (the )?(environment|env|config|secrets?|vault|keystore))",
      ThreatType.CREDENTIAL_ACCESS, "extracting secrets/credentials from environment or vault"),
@@ -1011,36 +1022,32 @@ _SAFE_MARKERS: list[str] = [
     r"(why|reason).{0,30}(medical ai|ai|system|model).{0,40}(should|must|ought to).{0,30}(refuse|not make|avoid|decline).{0,40}(individuali(s|z)ed|individual|treatment|clinical|diagnostic)",
     r"(refuse|should not|must not|ought not).{0,30}(make|provide|give|offer).{0,30}(individuali(s|z)ed|individual).{0,30}(treatment|clinical|medical|dosing) (decision|advice|recommendation)",
     r"(encourage|direct|refer|advise).{0,30}(patients?|users?|individuals?).{0,30}(seek|consult|talk to|contact).{0,30}(qualified|licensed|professional|healthcare).{0,30}(professional|practitioner|doctor|physician|provider)",
-]
 
-
-
-# Prompt patterns that are definitively safe regardless of keyword matches.
-# These are specific, unambiguous compliant request phrasings.
-_SAFE_WHITELIST: list[str] = [
-    r"^generate an aggregate summary.{0,100}no patient identifiers",
-    r"^generate a (complete|full|non[- ]?suppressed).{0,60}safety summary.{0,60}does not suppress",
-    r"^count the total number of (reported )?adverse events",
-    r"^generate a de[- ]?identified",
+    # ── Formerly _SAFE_WHITELIST (removed in P1-3): these used to return
+    # is_safe=True unconditionally, which let a deny-rule hit anywhere else
+    # in the same prompt be silently discarded — the exact bypass behind
+    # probes 1-3 in results/baseline/probe_bypasses.txt. They now only ever
+    # add to n_safe_markers, which _detect_heuristic only consults once the
+    # primary rule scan and augment_signals have both had a chance to flag
+    # real threats (see the `if threats:` branch above the safe-marker
+    # count). The four whole-prompt-shape patterns are anchored with `$` so
+    # they only match when the prompt IS that exact safe request, not when
+    # a real payload is appended after it.
+    r"^generate an aggregate summary.{0,100}no patient identifiers\b.{0,20}$",
+    r"^generate a (complete|full|non[- ]?suppressed).{0,60}safety summary.{0,60}does not suppress\b.{0,30}$",
+    r"^count the total number of (reported )?adverse events\b.{0,30}$",
+    r"^generate a de[- ]?identified.{0,40}(summary|report)\.?$",
     r"in a healthcare compliance training scenario.{0,60}(red flags|recognize|identify|prevent)",
-    # Prompt 6: summarizing compliant transparency practices (reporting negative findings)
     r"(summarize|explain|describe).{0,30}(how|why).{0,40}(pharmaceutical companies?|pharma|companies?).{0,40}(should|ought|must|need).{0,40}(communicate|report|disclose|present).{0,40}(clinical results?|findings?|data|evidence)",
-    # Prompt 10: explaining why AI should refuse individualized treatment decisions
     r"(explain|describe|discuss).{0,30}why.{0,40}(medical ai|ai|system|model).{0,40}(should|must|ought).{0,40}(refuse|not make|avoid|decline).{0,40}(individuali|treatment|clinical)",
-    # Classification / safety analysis wrappers on quoted/embedded samples
     r"^(classify|evaluate|analyze|assess|check|audit|explain|describe|discuss|identify|what is|why is).{0,80}(following|prompt|input|text|sample|phrase|sentence).{0,60}(as (malicious|benign|safe|harmful)|for (safety|threats?|risks?)|considered|prompt injection|jailbreak|attack|dangerous)",
     r"^(what|which).{0,40}(safety risk|threat|vulnerability).{0,40}(does the following|does this prompt|is present in)",
     r"^explain why.{0,80}(is considered|counts as|constitutes|is an example of).{0,60}(prompt injection|jailbreak|attack|manipulation|unsafe)",
-    # Analytical / benchmark / educational wrappers evaluating untrusted prompt samples
     r"^(i'?m|i am|we are)\s+(writing|building|evaluating|testing|running)\s+a\s+(security\s+)?(benchmark|evaluation|suite|dataset)",
     r"(evaluate|determine|assess|check)\s+whether\s+an?\s+(agent|model|system|guardrail)\s+should\s+(reject|block|refuse|flag)\s+it",
     r"^(explain|describe|discuss)\s+how\s+a\s+(security|guardrail|detection|filter|safety)\s+system\s+(should|can|would)\s+(detect|identify|block|flag|handle)",
-    r"do not execute (the|this|following)\s+(instruction|example|prompt|request)",
-    # Compliance & security training safe requests
     r"^how do i comply with (gdpr|hipaa|privacy|data protection regulations?)",
     r"^(explain|describe|outline|show)\s+how\s+to\s+recognize\s+(phishing|scam|fraud|suspicious)\s+(emails?|messages?).{0,50}to\s+train\s+(employees|staff|workers|users)",
-    # ── Educational definition queries (Task 8 false-positive prevention) ────────────────
-    # "What is an API key?" / "What is a password?" — definitional, not extraction
     r"^what\s+(is|are)\s+an?\s+(api[\s_-]?key|password|credential|secret|token|access\s*token|auth\s*token|encryption\s*key|private\s*key)\b[^.]{0,60}\?$",
     r"^(define|explain|describe)\s+(what\s+an?|an?)\s+(api[\s_-]?key|password|credential|secret|token)\s+(is|are)",
     r"^how\s+(do|does|should|can|are)\s+(api[\s_-]?keys?|passwords?|credentials?|secrets?|tokens?)\s+(work|function|be\s+stored|be\s+managed|be\s+protected|be\s+rotated)",
@@ -1122,22 +1129,18 @@ class ThreatDetector:
 
     # ── Public interface ─────────────────────────────────────────────────
 
-    def _is_analytical_wrapper(self, text: str) -> bool:
-        """Return True if prompt is asking to analyze/classify an untrusted sample."""
-        return any(re.search(p, text, re.IGNORECASE) for p in _SAFE_WHITELIST)
-
     def detect(self, prompt: str, ingestion: IngestionResult) -> DetectorVerdict:
         """Screen *prompt* and return a structured :class:`~guard.schemas.DetectorVerdict`.
 
-        Tiers are evaluated in order.  The heuristic layer always runs as an
-        inviolable safety baseline: even when the LLM returns a verdict, if the
-        heuristics detect threats the result is escalated to RISKY.  This ensures
-        the LLM can never silently override hard compliance rules.
+        Tiers are evaluated in order: ingestion-level decisive signals first,
+        then the deny-rule scan inside the heuristic tier, with safe-pattern
+        markers (formerly a hard whitelist override) only ever applied once
+        those have had a chance to flag the prompt — see _SAFE_MARKERS. The
+        heuristic layer always runs as an inviolable safety baseline: even
+        when the LLM returns a verdict, if the heuristics detect threats the
+        result is escalated to RISKY. This ensures the LLM can never silently
+        override hard compliance rules.
         """
-        # ── Check for analytical wrapper first (e.g. "Classify the following prompt: ...") ──
-        if self._is_analytical_wrapper(ingestion.normalized):
-            return self._detect_heuristic(ingestion)
-
         # ── Tier 1: ingestion-level decisive signals ──────────────────────
         if ingestion.flagged:
             return self._verdict_from_ingestion(ingestion)
@@ -1190,6 +1193,14 @@ class ThreatDetector:
 
         threats: list[ThreatType] = list(pharma_threats)  # pharma first
 
+        # ── Unsupported language (P1-5) ──────────────────────────────────
+        # Every rule below is an English-pattern regex; a non-English prompt
+        # cannot be trusted to have been scanned correctly by any of them,
+        # so this is reported as its own threat type rather than falling
+        # through to the generic OTHER fallback.
+        if ing.unsupported_language and ThreatType.UNSUPPORTED_LANGUAGE not in threats:
+            threats.append(ThreatType.UNSUPPORTED_LANGUAGE)
+
         # ── Jailbreak / encoded-payload signals ──────────────────────────
         if ing.signature_hits and ThreatType.JAILBREAK not in threats:
             threats.append(ThreatType.JAILBREAK)
@@ -1221,6 +1232,11 @@ class ThreatDetector:
         ]
         if evasion_flags:
             rationale_parts.append("Evasion techniques: " + "; ".join(evasion_flags))
+        if ing.unsupported_language:
+            rationale_parts.append(
+                "No reliable English-language signal detected; this system only "
+                "supports English and cannot confidently analyze other languages"
+            )
 
         return DetectorVerdict(
             is_safe=False,
@@ -1279,17 +1295,6 @@ class ThreatDetector:
         text = ingestion.normalized.lower()
         threats: list[ThreatType] = []
         reasons: list[str] = []
-
-        # ── Safe whitelist: definitively compliant requests ───────────────────
-        if any(re.search(p, text, re.IGNORECASE) for p in _SAFE_WHITELIST):
-            return DetectorVerdict(
-                is_safe=True,
-                category=Category.RESPONSIBLE,
-                threat_types=[ThreatType.NONE],
-                ambiguity_flags=[],
-                rationale="Prompt matches a known safe compliant pattern.",
-                confidence=0.92,
-            )
 
         # ── Primary rule scan ────────────────────────────────────────────────────
         for pattern, ttype, why in _RULES:
