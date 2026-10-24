@@ -10,6 +10,7 @@ Usage:
 
 import sys
 import textwrap
+
 sys.path.insert(0, ".")
 
 from guard import PromptGuard
@@ -28,6 +29,7 @@ def T(prompt, expect_blocked, category, note=""):
 
 # Re-import all adversarial suite cases
 from scripts.adversarial_test_suite import TESTS as ADV_TESTS
+
 TESTS.extend(ADV_TESTS)
 
 # --- Additional hardening cases (Tasks 14 + 15) ---

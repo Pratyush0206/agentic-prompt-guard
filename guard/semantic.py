@@ -26,8 +26,8 @@ from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Optional
 
 try:
-    from sentence_transformers import SentenceTransformer  # type: ignore[import]
     import numpy as np  # type: ignore[import]
+    from sentence_transformers import SentenceTransformer  # type: ignore[import]
 
     _HAS_ST = True
 except ImportError:

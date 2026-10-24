@@ -12,15 +12,15 @@ All tests run offline with use_llm=False.
 """
 
 import pytest
+
 from guard import PromptGuard
 from guard.heuristics import (
-    phrase_variants_match,
-    proximity_match,
-    context_flags,
-    physical_harm_score,
-    credential_extraction_score,
-    agent_abuse_score,
     _OVERRIDE_PHRASES,
+    context_flags,
+    credential_extraction_score,
+    phrase_variants_match,
+    physical_harm_score,
+    proximity_match,
 )
 from guard.schemas import ThreatType
 

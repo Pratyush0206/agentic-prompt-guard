@@ -1,10 +1,12 @@
 """Debug normalized text AND rule hits for prompts 6 and 10."""
+import os
 import re
-import sys, os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from guard.ingestion import _full_normalize, ingest
 from guard.detector import _RULES
+from guard.ingestion import _full_normalize, ingest
 
 prompts = {
     6: "Summarize how pharmaceutical companies should communicate promising clinical results while clearly reporting negative findings, uncertainty, and adverse events.",
@@ -16,7 +18,7 @@ for num, prompt in prompts.items():
     print(f"PROMPT {num}: {prompt}")
     normalized = _full_normalize(prompt).lower()
     print(f"NORMALIZED:  {normalized}")
-    print(f"\n--- RULES FIRING ON NORMALIZED ---")
+    print("\n--- RULES FIRING ON NORMALIZED ---")
     fired = False
     for pattern, ttype, why in _RULES:
         m = re.search(pattern, normalized, re.IGNORECASE)
@@ -29,7 +31,7 @@ for num, prompt in prompts.items():
         print("  (none)")
 
     # Also check via ingest
-    print(f"\n--- INGEST result (no semantic) ---")
+    print("\n--- INGEST result (no semantic) ---")
     # Disable semantic by patching
     import guard.ingestion as gi
     orig_import = gi.ingest

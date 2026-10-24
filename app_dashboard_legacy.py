@@ -28,7 +28,9 @@ import random
 import pandas as pd
 import streamlit as st
 
+import generate_dataset as gen
 from guard import PromptGuard, RewriteStatus, ThreatType
+from guard import datasets as ds
 from guard.cache import get_cache
 from guard.ingestion import ingest, normalization_stages
 from guard.semantic import (
@@ -36,9 +38,6 @@ from guard.semantic import (
     difflib_top_matches,
     get_matcher,
 )
-from guard import datasets as ds
-
-import generate_dataset as gen
 
 st.set_page_config(
     page_title="Agentic Prompt Guard",

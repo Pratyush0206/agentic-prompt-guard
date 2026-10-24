@@ -10,7 +10,6 @@ heuristic fallback path as the rest of the pytest suite (no Ollama needed).
 from pathlib import Path
 
 import pytest
-
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = str(Path(__file__).parent.parent / "app.py")

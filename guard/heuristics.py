@@ -27,7 +27,6 @@ from typing import NamedTuple
 
 from .schemas import ThreatType
 
-
 # ---------------------------------------------------------------------------
 # Signal deduplication -- Tasks 11 + 12
 # ---------------------------------------------------------------------------

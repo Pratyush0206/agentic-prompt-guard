@@ -1,6 +1,8 @@
 """Find exact rule firing on prompts 6 and 10 without semantic loading."""
+import os
 import re
-import sys, os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from guard.detector import _RULES

@@ -1,6 +1,8 @@
 """Debug heuristic detection for failing prompts WITHOUT using semantic."""
+import os
 import re
-import sys, os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Patch to disable semantic loading entirely
@@ -15,8 +17,7 @@ def _patched_ingest(prompt):
 
 gi_module.ingest = _patched_ingest
 
-from guard.detector import ThreatDetector, _RULES
-from guard.ingestion import ingest
+from guard.detector import _RULES, ThreatDetector
 
 detector = ThreatDetector(llm=None)  # heuristic only
 
@@ -35,11 +36,11 @@ for label, prompt in prompts:
     text = ing.normalized.lower()
     print(f"  normalized (first 100): {text[:100]}")
     print(f"  flagged={ing.flagged}, sigs={ing.signature_hits}")
-    
+
     verdict = detector._detect_heuristic(ing)
     print(f"  is_safe={verdict.is_safe}, threats={[t.value for t in verdict.threat_types]}")
     print(f"  rationale: {verdict.rationale[:100]}")
-    
+
     # Show all matching rules
     print("  Rules firing:")
     for pattern, ttype, why in _RULES:

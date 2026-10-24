@@ -1,9 +1,11 @@
 """Debug which rules fire for prompts 6 and 10."""
+import os
 import re
-import sys, os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from guard.detector import _RULES, _SAFE_MARKERS, _STRONG_SAFE_FRAMES, _PHARMA_THREATS
+from guard.detector import _RULES, _SAFE_MARKERS, _STRONG_SAFE_FRAMES
 
 prompts = {
     6: "Summarize how pharmaceutical companies should communicate promising clinical results while clearly reporting negative findings, uncertainty, and adverse events.",

@@ -8,6 +8,7 @@ Run with:
 
 import sys
 import textwrap
+
 sys.path.insert(0, ".")
 
 from guard import PromptGuard

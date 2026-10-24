@@ -51,8 +51,8 @@ from guard.datasets import (
     dataset_stats,
     ingest_dataset,
 )
-from guard.ingestion import ingest
 from guard.detector import ThreatDetector
+from guard.ingestion import ingest
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -173,7 +173,7 @@ def print_metrics(m: dict) -> None:
     print(f"  Recall    {_bar(m['recall'])}  {m['recall']:.4f}")
     print(f"  F1        {_bar(m['f1'])}  {m['f1']:.4f}")
     print(f"{'─' * 60}")
-    print(f"  Confusion matrix (Unsafe = positive class)")
+    print("  Confusion matrix (Unsafe = positive class)")
     print(f"    TP={m['tp']:>7,}  FN={m['fn']:>7,}   (missed unsafe)")
     print(f"    FP={m['fp']:>7,}  TN={m['tn']:>7,}   (false alarms / safe misclassified)")
     print(f"{'─' * 60}")
