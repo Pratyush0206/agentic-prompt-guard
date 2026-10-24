@@ -1,0 +1,15 @@
+[project]
+name = "agentic-prompt-guard"
+version = "0.1.0"
+description = "Guardrail pipeline for screening and sandboxing agentic prompts."
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

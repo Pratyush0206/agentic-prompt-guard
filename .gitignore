@@ -78,3 +78,6 @@ data/unique_prompts.csv
 evaluation_report*.txt
 evaluation_report*.json
 metrics_*.csv
+
+# Scratch/partial result files
+results/*.tmp
