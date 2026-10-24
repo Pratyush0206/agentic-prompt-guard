@@ -38,6 +38,7 @@ class ThreatType(str, Enum):
     CREDENTIAL_ACCESS = "credential_access"       # extracting secrets, api keys, credentials
     EXCESSIVE_AGENCY = "excessive_agency"         # tool abuse, environment tampering, unrestricted actions
     PHYSICAL_HARM = "physical_harm"               # harm to persons, violence, self-harm
+    UNSUPPORTED_LANGUAGE = "unsupported_language"  # no reliable English-language signal
     OTHER = "other"
 
 

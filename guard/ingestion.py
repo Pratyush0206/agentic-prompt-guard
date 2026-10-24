@@ -117,7 +117,6 @@ _JAILBREAK_SIGNATURES: list[str] = [
     # ── Classic prompt-injection phrases ──────────────────────────────────
     r"ignore (all )?(previous|prior|above|your) (instructions|prompts|rules|directives|training|restrictions)",
     r"disregard (the )?(system|previous|prior|all) (prompt|instructions|guidelines|rules|training)",
-    r"\bDAN\b",
     r"do anything now",
     r"developer mode",
     r"pretend (you are|to be)",
@@ -148,6 +147,15 @@ _JAILBREAK_SIGNATURES: list[str] = [
     r"you (must|will|shall|are required to) (ignore|bypass|disregard|override)",
     # ── Encoding tricks ───────────────────────────────────────────────────
     r"encode.{0,30}(harmful|restricted|blocked|unsafe).{0,30}(base64|hex|rot)",
+]
+
+# Signatures that must stay case-SENSITIVE: "DAN" (the jailbreak persona) is
+# an all-caps acronym that collides with the common first name "Dan" when
+# matched case-insensitively (P1-4 regression — "My colleague Dan asked...").
+# Kept separate from _JAILBREAK_SIGNATURES, which is intentionally
+# case-insensitive for every other signature.
+_JAILBREAK_SIGNATURES_CASE_SENSITIVE: list[str] = [
+    r"\bDAN\b",
 ]
 
 # Similarity threshold used for the difflib fallback path.
@@ -218,6 +226,62 @@ def _defuse_whitespace_injection(text: str) -> str:
 def _apply_leetspeak(text: str) -> str:
     """Translate common leet-speak digit/symbol substitutions back to letters."""
     return "".join(_LEET.get(ch, ch) for ch in text)
+
+
+# ---------------------------------------------------------------------------
+# Language detection (P1-5) — stdlib-only, English vs. everything else
+# ---------------------------------------------------------------------------
+
+# Common English function words. A real English sentence of non-trivial
+# length almost always contains at least one of these; a non-English
+# sentence (even one written in the Latin alphabet, e.g. Spanish/French,
+# which a script-ratio check alone would miss since they share most of the
+# Latin alphabet with English) essentially never does.
+_ENGLISH_STOPWORDS: frozenset = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "for", "with", "and", "or", "but", "not",
+    "no", "yes", "this", "that", "these", "those", "it", "its", "you",
+    "your", "i", "we", "our", "they", "their", "he", "she", "his", "her",
+    "what", "which", "who", "whom", "how", "why", "when", "where", "do",
+    "does", "did", "can", "could", "should", "must", "will", "would",
+    "shall", "may", "might", "please", "me", "my", "us", "as", "by",
+    "from", "into", "about", "if", "then", "than", "so", "such", "also",
+    "all", "any", "each", "other", "some", "more", "most", "very",
+})
+
+# Below this many word tokens there isn't enough signal to judge language
+# reliably, so short prompts are never flagged as unsupported-language.
+_MIN_TOKENS_FOR_LANGUAGE_CHECK = 5
+
+# Fraction of alphabetic characters that must be non-ASCII before a prompt
+# is considered to be in a non-Latin script (Cyrillic, Greek, CJK, Arabic...).
+_NON_ASCII_SCRIPT_THRESHOLD = 0.25
+
+
+def detect_script_ratio(text: str) -> float:
+    """Return the fraction of alphabetic characters in *text* that are non-ASCII."""
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return 0.0
+    non_ascii = sum(1 for ch in letters if ord(ch) > 127)
+    return non_ascii / len(letters)
+
+
+def is_unsupported_language(text: str) -> bool:
+    """Heuristic: True when *text* shows no reliable sign of being English.
+
+    Two stdlib-only signals, combined conservatively so ordinary short or
+    jargon-heavy English prompts are never misflagged:
+      1. Non-ASCII letter ratio — catches non-Latin scripts outright.
+      2. Zero English-stopword coverage over enough tokens — catches
+         Latin-script non-English languages that signal 1 would miss.
+    """
+    tokens = re.findall(r"[^\W\d_]+", text.lower(), re.UNICODE)
+    if len(tokens) < _MIN_TOKENS_FOR_LANGUAGE_CHECK:
+        return False
+    if detect_script_ratio(text) >= _NON_ASCII_SCRIPT_THRESHOLD:
+        return True
+    return not any(tok in _ENGLISH_STOPWORDS for tok in tokens)
 
 
 def _full_normalize(text: str) -> str:
@@ -298,6 +362,12 @@ class IngestionResult:
         True if any leetspeak substitution was performed.
     whitespace_injection_detected:
         True if whitespace-injected single-char runs were collapsed.
+    unsupported_language:
+        True if the prompt shows no reliable sign of being English (see
+        :func:`is_unsupported_language`). This product only supports
+        English; such prompts are a decisive signal (folded into
+        ``flagged``) since none of the English-pattern rules below can be
+        trusted to have scanned them correctly.
     """
 
     original: str
@@ -309,6 +379,7 @@ class IngestionResult:
     homoglyph_detected: bool = False
     leetspeak_detected: bool = False
     whitespace_injection_detected: bool = False
+    unsupported_language: bool = False
 
     # ── Canonical text surfaces (computed on-demand) ──────────────────────
 
@@ -346,6 +417,7 @@ class IngestionResult:
         return (
             bool(self.signature_hits or self.decoded_payloads)
             or self.similarity >= _SIMILARITY_THRESHOLD
+            or self.unsupported_language
         )
 
 
@@ -414,6 +486,9 @@ def ingest(prompt: str) -> IngestionResult:
         for pattern in _JAILBREAK_SIGNATURES:
             if re.search(pattern, hay, re.IGNORECASE) and pattern not in hits:
                 hits.append(pattern)
+        for pattern in _JAILBREAK_SIGNATURES_CASE_SENSITIVE:
+            if re.search(pattern, hay) and pattern not in hits:
+                hits.append(pattern)
 
     # ── Similarity (semantic embeddings with difflib fallback) ───────────
     # Lazy import to avoid circular dependency (semantic imports nothing from guard).
@@ -422,12 +497,15 @@ def ingest(prompt: str) -> IngestionResult:
     # Compute similarity on the string BEFORE leetspeak. Leetspeak (e.g. 60kg -> gokg)
     # destroys pretrained word embeddings, falsely lowering the similarity score.
     clean_text = after_ws.strip()
-    
+
     matcher = get_matcher()
     if matcher is not None:
         _, sim_score, nearest = matcher.match(clean_text)
     else:
         sim_score, nearest = difflib_similarity(clean_text, ATTACK_CORPUS)
+
+    # ── Language check (on the pre-leetspeak text, same reasoning as similarity) ──
+    unsupported_language = is_unsupported_language(clean_text)
 
     return IngestionResult(
         original=prompt,
@@ -439,4 +517,5 @@ def ingest(prompt: str) -> IngestionResult:
         homoglyph_detected=homoglyph_detected,
         leetspeak_detected=leetspeak_detected,
         whitespace_injection_detected=whitespace_injection_detected,
+        unsupported_language=unsupported_language,
     )
