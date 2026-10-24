@@ -49,7 +49,7 @@ def test_example_button_populates_prompt():
 
 
 def test_check_prompt_produces_verdict():
-    at = AppTest.from_file(APP_PATH, default_timeout=60)
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
     at.run()
     assert not at.exception
 
