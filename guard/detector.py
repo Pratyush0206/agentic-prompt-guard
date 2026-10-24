@@ -254,6 +254,25 @@ JSON object — no additional text, no markdown code fences.\
 # Heuristic rule engine
 # ---------------------------------------------------------------------------
 
+
+def _scan_texts(ing: IngestionResult) -> list[str]:
+    """Lowercased texts the deny-rule scan checks (P2-3).
+
+    Every normalisation variant (raw, homoglyph-fixed, whitespace-defused,
+    leet-normalized — see IngestionResult.variants), not just the single
+    `normalized` text, so a leetspeak-obfuscated rule hit is still caught
+    without needing `normalized` itself to be leet-corrupted (that would
+    corrupt ordinary numbers like "Q1" or "60kg" for every other check).
+    Falls back to `[normalized]` for callers that construct an
+    IngestionResult directly without populating `variants`.
+    """
+    return [v.lower() for v in ing.variants] if ing.variants else [ing.normalized.lower()]
+
+
+def _any_variant_match(pattern: str, texts: list[str]) -> bool:
+    return any(re.search(pattern, t, re.IGNORECASE) for t in texts)
+
+
 # Each entry: (regex_pattern, ThreatType, rationale_fragment)
 _RULES: list[tuple[str, ThreatType, str]] = [
     # ── Off-label promotion ───────────────────────────────────────────────
@@ -1182,12 +1201,12 @@ class ThreatDetector:
         labelled with the pharma threat — enabling the rewriter to produce a
         compliant rewrite instead of returning INVALID.
         """
-        text = ing.normalized.lower()
+        texts = _scan_texts(ing)
 
         # ── Scan for pharma-domain threats first ─────────────────────────
         pharma_threats: list[ThreatType] = []
         for pattern, ttype, _ in _RULES:
-            if ttype in _PHARMA_THREATS and re.search(pattern, text, re.IGNORECASE):
+            if ttype in _PHARMA_THREATS and _any_variant_match(pattern, texts):
                 if ttype not in pharma_threats:
                     pharma_threats.append(ttype)
 
@@ -1209,7 +1228,7 @@ class ThreatDetector:
 
         # ── Remaining non-pharma rule hits ───────────────────────────────
         for pattern, ttype, _ in _RULES:
-            if ttype not in _PHARMA_THREATS and re.search(pattern, text, re.IGNORECASE):
+            if ttype not in _PHARMA_THREATS and _any_variant_match(pattern, texts):
                 if ttype not in threats:
                     threats.append(ttype)
 
@@ -1293,12 +1312,13 @@ class ThreatDetector:
         The final verdict is derived from the combined signal set.
         """
         text = ingestion.normalized.lower()
+        texts = _scan_texts(ingestion)
         threats: list[ThreatType] = []
         reasons: list[str] = []
 
-        # ── Primary rule scan ────────────────────────────────────────────────────
+        # ── Primary rule scan (every normalisation variant — P2-3) ───────────────
         for pattern, ttype, why in _RULES:
-            if re.search(pattern, text, re.IGNORECASE):
+            if _any_variant_match(pattern, texts):
                 if ttype not in threats:
                     threats.append(ttype)
                 reasons.append(why)

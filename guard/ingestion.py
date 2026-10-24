@@ -89,9 +89,10 @@ _HOMOGLYPH: dict[int, str] = {
 
 # Leetspeak substitution map — single characters only (applied char-by-char).
 # Note: this is aggressive by design; it may alter legitimate numeric text
-# (e.g. "Q1" → "Qi") but the resulting string is only used internally for
-# threat detection, not returned to the caller.  The original prompt is
-# preserved in IngestionResult.original.
+# (e.g. "Q1" → "Qi"). Because of that, the leet-normalized text is used only
+# as one of several scan variants (see IngestionResult.variants) — never as
+# the primary `normalized` text, which must keep ordinary numbers intact
+# (P2-3). The original prompt is preserved in IngestionResult.original.
 _LEET: dict[str, str] = {
     "1": "i",
     "!": "i",
@@ -298,33 +299,147 @@ def _full_normalize(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _try_decode(text: str) -> list[str]:
-    """Surface hidden instructions smuggled via base64 / hex / ROT13 encoding."""
-    decoded: list[str] = []
+# P2-4: bounds on decode work per prompt, so an adversarially large or
+# repetitive input (e.g. a 100k-char string) cannot blow up decode time —
+# every pass below operates on text already truncated to _MAX_CANDIDATE_LEN,
+# and the total candidate count across all passes/depths is capped too.
+_MAX_DECODE_CANDIDATES = 20
+_MAX_CANDIDATE_LEN = 10_000
+_MAX_DECODE_DEPTH = 3
 
-    # base64 — look for long token-like runs of base64 alphabet chars.
-    for token in re.findall(r"[A-Za-z0-9+/=]{16,}", text):
+_MEANINGFUL_RE = re.compile(r"[a-zA-Z]{3,}")
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+# Gate for speculative transforms (ROT13, string-reversal) that have no
+# other signal of their own: only trust the transformed text if it surfaces
+# one of these recognizable attack phrases, not merely "looks like text".
+_CIPHER_JAILBREAK_RE = re.compile(r"ignore .*instructions|developer mode", re.IGNORECASE)
+
+
+def _looks_meaningful(candidate: str) -> bool:
+    return candidate.isprintable() and bool(_MEANINGFUL_RE.search(candidate))
+
+
+def _decode_base64_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    # Shorter minimum (12, was 16) so shorter smuggled payloads are still caught.
+    for token in re.findall(r"[A-Za-z0-9+/=]{12,}", text):
         try:
             candidate = base64.b64decode(token, validate=True).decode("utf-8", "strict")
-            if candidate.isprintable() and re.search(r"[a-zA-Z]{3,}", candidate):
-                decoded.append(candidate)
+            if _looks_meaningful(candidate):
+                out.append(candidate)
         except (binascii.Error, ValueError, UnicodeDecodeError):
             pass
+    return out
 
-    # hex — look for sequences of 4+ hex byte pairs.
+
+def _decode_hex_tokens(text: str) -> list[str]:
+    out: list[str] = []
     for token in re.findall(r"(?:[0-9a-fA-F]{2}\s*){8,}", text):
         try:
             raw = bytes.fromhex(re.sub(r"\s+", "", token))
             candidate = raw.decode("utf-8", "strict")
-            if candidate.isprintable() and re.search(r"[a-zA-Z]{3,}", candidate):
-                decoded.append(candidate)
+            if _looks_meaningful(candidate):
+                out.append(candidate)
         except (ValueError, UnicodeDecodeError):
             pass
+    return out
+
+
+def _decode_urlencoded(text: str) -> list[str]:
+    if "%" not in text:
+        return []
+    try:
+        candidate = urllib.parse.unquote(text, errors="strict")
+    except Exception:  # noqa: BLE001 — malformed %XX sequences, etc.
+        return []
+    return [candidate] if candidate != text and _looks_meaningful(candidate) else []
+
+
+def _decode_unicode_escapes(text: str) -> list[str]:
+    """Decode literal textual ``\\u00XX`` escape sequences (not real Unicode
+    chars — those are already handled by NFKC normalisation — but the
+    six-character *text* "\\u0069" etc., a common filter-evasion trick)."""
+    if not _UNICODE_ESCAPE_RE.search(text):
+        return []
+    try:
+        candidate = _UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    except ValueError:
+        return []
+    return [candidate] if candidate != text and _looks_meaningful(candidate) else []
+
+
+def _decode_reversed(text: str) -> list[str]:
+    """Flag a reversed string as a candidate, but only when it actually
+    surfaces a recognizable attack phrase (same gate as the ROT13 check
+    below) — `_looks_meaningful` alone is far too weak here: reversing any
+    ordinary English sentence still "looks like text" (printable, has
+    letter runs), so without this gate almost every prompt's reversed form
+    would be flagged as a decoded payload."""
+    reversed_text = text[::-1]
+    if reversed_text == text:
+        return []
+    if _CIPHER_JAILBREAK_RE.search(reversed_text):
+        return [reversed_text]
+    return []
+
+
+def _decode_one_layer(text: str) -> list[str]:
+    """One pass of every *recursive* decode strategy (not the reverse-string
+    or ROT13 checks, which only make sense on the original text once)."""
+    out: list[str] = []
+    out.extend(_decode_base64_tokens(text))
+    out.extend(_decode_hex_tokens(text))
+    out.extend(_decode_urlencoded(text))
+    out.extend(_decode_unicode_escapes(text))
+    return out
+
+
+def _try_decode(text: str) -> list[str]:
+    """Surface hidden instructions smuggled via base64 / hex / URL-encoding /
+    textual unicode escapes / ROT13 / string reversal, including nested
+    encodings up to :data:`_MAX_DECODE_DEPTH` layers deep (e.g. hex-of-base64,
+    or base64-of-base64). Bounded by :data:`_MAX_DECODE_CANDIDATES` total
+    results and :data:`_MAX_CANDIDATE_LEN` chars per candidate (P2-4).
+    """
+    text = text[:_MAX_CANDIDATE_LEN]
+    decoded: list[str] = []
+    seen: set[str] = {text}
+
+    def _add(candidate: str) -> bool:
+        if len(decoded) >= _MAX_DECODE_CANDIDATES:
+            return False
+        candidate = candidate[:_MAX_CANDIDATE_LEN]
+        if candidate in seen:
+            return False
+        seen.add(candidate)
+        decoded.append(candidate)
+        return True
+
+    frontier = [text]
+    for _depth in range(_MAX_DECODE_DEPTH):
+        if len(decoded) >= _MAX_DECODE_CANDIDATES:
+            break
+        next_frontier: list[str] = []
+        for layer_text in frontier:
+            for candidate in _decode_one_layer(layer_text):
+                if _add(candidate):
+                    next_frontier.append(candidate)
+                if len(decoded) >= _MAX_DECODE_CANDIDATES:
+                    break
+            if len(decoded) >= _MAX_DECODE_CANDIDATES:
+                break
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    for candidate in _decode_reversed(text):
+        _add(candidate)
 
     # ROT13 — only flag if it surfaces a known jailbreak phrase.
     rot = codecs.encode(text, "rot_13")
-    if re.search(r"ignore .*instructions|developer mode", rot, re.IGNORECASE):
-        decoded.append(rot)
+    if _CIPHER_JAILBREAK_RE.search(rot):
+        _add(rot)
 
     return decoded
 
@@ -362,6 +477,15 @@ class IngestionResult:
         True if any leetspeak substitution was performed.
     whitespace_injection_detected:
         True if whitespace-injected single-char runs were collapsed.
+    variants:
+        The text after each normalisation pass, in order: raw (NFKC +
+        invisible-stripped), homoglyph-fixed, whitespace-defused,
+        leet-normalized. ``normalized`` is the whitespace-defused variant
+        (not leet-normalized — see below); signature matching in
+        :func:`ingest` and the rule scans in :mod:`guard.detector` check
+        every variant so a leetspeak-obfuscated attack is still caught via
+        the leet-normalized variant without corrupting ordinary numeric
+        text (``Q1``, ``60kg``) in the text everything else operates on.
     unsupported_language:
         True if the prompt shows no reliable sign of being English (see
         :func:`is_unsupported_language`). This product only supports
@@ -380,6 +504,7 @@ class IngestionResult:
     leetspeak_detected: bool = False
     whitespace_injection_detected: bool = False
     unsupported_language: bool = False
+    variants: list[str] = field(default_factory=list)
 
     # ── Canonical text surfaces (computed on-demand) ──────────────────────
 
@@ -477,10 +602,18 @@ def ingest(prompt: str) -> IngestionResult:
     after_leet = _apply_leetspeak(after_ws)
     leetspeak_detected = after_leet != after_ws
 
-    normalized = after_leet.strip()
+    # `normalized` is the whitespace-defused variant, NOT leet-normalized:
+    # leet substitution corrupts ordinary numeric text ("Q1" -> "Qi", "60kg"
+    # -> "gokg"), so it must never be the primary text that detector.py's
+    # rule scans and SAFE_MARKERS/STRONG_SAFE_FRAMES checks operate on
+    # (P2-3). The leet-normalized text is still scanned for signatures
+    # below (and exposed via `variants`) so a leetspeak-obfuscated attack
+    # is still caught.
+    normalized = after_ws.strip()
+    variants = [after_invisible, after_homoglyph, after_ws, after_leet]
 
-    # ── Signature matching (on normalised text + any decoded payloads) ───
-    haystacks = [normalized] + decoded
+    # ── Signature matching (every normalisation variant + decoded payloads) ──
+    haystacks = variants + decoded
     hits: list[str] = []
     for hay in haystacks:
         for pattern in _JAILBREAK_SIGNATURES:
@@ -494,18 +627,16 @@ def ingest(prompt: str) -> IngestionResult:
     # Lazy import to avoid circular dependency (semantic imports nothing from guard).
     from .semantic import ATTACK_CORPUS, difflib_similarity, get_matcher
 
-    # Compute similarity on the string BEFORE leetspeak. Leetspeak (e.g. 60kg -> gokg)
+    # Compute similarity on `normalized` (pre-leetspeak). Leetspeak (e.g. 60kg -> gokg)
     # destroys pretrained word embeddings, falsely lowering the similarity score.
-    clean_text = after_ws.strip()
-
     matcher = get_matcher()
     if matcher is not None:
-        _, sim_score, nearest = matcher.match(clean_text)
+        _, sim_score, nearest = matcher.match(normalized)
     else:
-        sim_score, nearest = difflib_similarity(clean_text, ATTACK_CORPUS)
+        sim_score, nearest = difflib_similarity(normalized, ATTACK_CORPUS)
 
     # ── Language check (on the pre-leetspeak text, same reasoning as similarity) ──
-    unsupported_language = is_unsupported_language(clean_text)
+    unsupported_language = is_unsupported_language(normalized)
 
     return IngestionResult(
         original=prompt,
@@ -518,4 +649,5 @@ def ingest(prompt: str) -> IngestionResult:
         leetspeak_detected=leetspeak_detected,
         whitespace_injection_detected=whitespace_injection_detected,
         unsupported_language=unsupported_language,
+        variants=variants,
     )
