@@ -10,6 +10,18 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+# E501 (line-too-long) is not enforced: guard/detector.py's rule tables are
+# long regex literals by nature (one alternation per line is far less
+# readable than wrapping mid-pattern), and manually wrapping ~220 lines of
+# security-rule regexes repo-wide carries real risk of introducing a subtle
+# matching bug for no behavioral benefit (P2-2's "no behavior change" goal).
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# sys.path.insert(...) must run before these imports so the local package
+# resolves without being installed — standard pattern for dev/eval scripts
+# run directly from the repo, not a style slip.
+"scripts/**" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
