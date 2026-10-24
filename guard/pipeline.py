@@ -22,17 +22,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import threading
 from collections import OrderedDict
 from typing import Optional
 
-from .cache import get_cache
+from .cache import PIPELINE_VERSION, get_cache, make_key
 from .detector import ThreatDetector
+from .health import check_strict, format_layer_status, is_degraded, layer_status
 from .ingestion import ingest
 from .llm import OllamaClient
 from .rewriter import SafeRewriter
 from .sandbox import SafeSandbox
 from .schemas import Category, GuardResult, RewriteStatus, ThreatType
+from .semantic import get_matcher
+from .validator import validate
+
+log = logging.getLogger("guard.pipeline")
 
 # Threats that must ALWAYS result in a hard block regardless of whether a
 # safe rewrite can be generated.  For these, the rewrite is produced for
@@ -56,8 +62,13 @@ _HARD_BLOCK_THREATS: frozenset[ThreatType] = frozenset({
     ThreatType.HYPOTHETICAL_BYPASS,
     ThreatType.ENCODED_PAYLOAD,
     ThreatType.PROMPT_OVERLOAD,
+    # Ingestion-decisive, non-rewriteable (P2-6): like JAILBREAK/ENCODED_PAYLOAD
+    # above, this is only ever set by _verdict_from_ingestion as a decisive
+    # signal (see P1-5) — there is no safe rewrite for "we cannot reliably
+    # analyze this language", so it must hard-block rather than fall through
+    # to the remediation loop, where it previously landed on INVALID anyway.
+    ThreatType.UNSUPPORTED_LANGUAGE,
 })
-from .validator import validate
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +78,11 @@ from .validator import validate
 
 class _LRUCache:
     """Simple thread-safe LRU cache backed by an ``OrderedDict``.
+
+    Stores and returns independent deep copies of each
+    :class:`~guard.schemas.GuardResult` — never the live object a caller
+    was handed — so mutating a returned result can never affect what a
+    later ``get``/``put`` sees, in either direction.
 
     Parameters
     ----------
@@ -85,13 +101,17 @@ class _LRUCache:
             if key not in self._cache:
                 return None
             self._cache.move_to_end(key)
-            return self._cache[key]
+            stored = self._cache[key]
+        hit = stored.model_copy(deep=True)
+        hit.audit_log.append("cache=lru_hit")
+        return hit
 
     def put(self, key: str, value: GuardResult) -> None:
+        stored = value.model_copy(deep=True)
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
-            self._cache[key] = value
+            self._cache[key] = stored
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)  # evict least-recently-used
 
@@ -124,6 +144,12 @@ class PromptGuard:
     cache_size:
         Maximum number of prompt results to keep in the in-memory LRU cache.
         Set to ``0`` to disable caching.
+    strict:
+        When ``True``, raise :class:`~guard.health.LayerUnavailable` at
+        construction time if the LLM (when ``use_llm=True``) or the
+        semantic matcher is requested but not actually available, instead
+        of silently falling back to a weaker deterministic path. See
+        :mod:`guard.health`. Default ``False`` (fail-open, as before).
 
     Redis cache
     -----------
@@ -146,6 +172,7 @@ class PromptGuard:
         use_llm: bool = True,
         host: str = "http://localhost:11434",
         cache_size: int = 256,
+        strict: bool = False,
     ) -> None:
         llm: Optional[OllamaClient] = None
         if use_llm:
@@ -153,16 +180,47 @@ class PromptGuard:
             if candidate.available():
                 llm = candidate
         self.llm_active = llm is not None
+        semantic_active = get_matcher() is not None
+
+        check_strict(
+            strict=strict,
+            llm_requested=use_llm,
+            llm_active=self.llm_active,
+            semantic_active=semantic_active,
+        )
+        self.strict = strict
+        self._layer_status = layer_status(
+            llm_requested=use_llm,
+            llm_active=self.llm_active,
+            model=model,
+            semantic_active=semantic_active,
+            redis_active=get_cache() is not None,
+        )
+        if not strict and is_degraded(
+            llm_requested=use_llm, llm_active=self.llm_active, semantic_active=semantic_active
+        ):
+            log.warning("guard.pipeline — running with degraded layer(s): %s", self._layer_status)
+
         self.detector = ThreatDetector(llm)
         self.rewriter = SafeRewriter(llm)
         self.sandbox = SafeSandbox(llm)
         self._cache = _LRUCache(maxsize=cache_size) if cache_size > 0 else None
 
-    # ── Public API ───────────────────────────────────────────────────────
+        # Cache version: PIPELINE_VERSION plus a hash of the config that
+        # actually affects detection output (llm on/off, model name), so
+        # changing either naturally invalidates every stale cache entry —
+        # old results for a different config can never be served as if
+        # they came from this one. Shared by both the Redis and LRU caches
+        # via guard.cache.make_key, so there is exactly one key scheme.
+        config_hash = hashlib.sha256(f"{model}:{self.llm_active}".encode()).hexdigest()[:12]
+        self._cache_version = f"{PIPELINE_VERSION}:{config_hash}"
 
-    @staticmethod
-    def _cache_key(prompt: str, execute: bool) -> str:
-        return hashlib.sha256(f"{execute}:{prompt}".encode()).hexdigest()[:24]
+    def health(self) -> dict[str, str]:
+        """Return which optional layers (LLM, semantic matcher, Redis
+        cache) are active vs. degraded — see :mod:`guard.health`."""
+        return dict(self._layer_status)
+
+    # ── Public API ───────────────────────────────────────────────────────
 
     def check(self, prompt: str, execute: bool = False) -> GuardResult:
         """Screen *prompt* synchronously.
@@ -189,16 +247,18 @@ class PromptGuard:
             Full decision record including category, allowed/blocked verdict,
             rewrite (if any), and an append-only ``audit_log``.
         """
+        version = self._cache_version
+
         # ── Layer 1: Redis distributed cache ─────────────────────────────
         _redis = get_cache()
         if _redis is not None:
-            redis_hit = _redis.get(prompt)
+            redis_hit = _redis.get(prompt, execute, version)
             if redis_hit is not None:
                 return redis_hit
 
         # ── Layer 2: In-process LRU cache ────────────────────────────────
+        key = make_key(prompt, execute, version)
         if self._cache is not None:
-            key = self._cache_key(prompt, execute)
             cached = self._cache.get(key)
             if cached is not None:
                 return cached
@@ -208,7 +268,7 @@ class PromptGuard:
 
         # Store in Redis (full GuardResult JSON, TTL-backed).
         if _redis is not None:
-            _redis.set(prompt, result)
+            _redis.set(prompt, result, execute, version)
 
         # Store in local LRU.
         if self._cache is not None:
@@ -237,6 +297,7 @@ class PromptGuard:
         log: list[str] = []
         backend = "ollama" if self.llm_active else "heuristic-fallback"
         log.append(f"backend={backend}")
+        log.append(format_layer_status(self._layer_status))
 
         # Step 1: ingestion.
         ing = ingest(prompt)
