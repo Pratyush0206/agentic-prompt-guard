@@ -81,3 +81,6 @@ metrics_*.csv
 
 # Scratch/partial result files
 results/*.tmp
+
+# Personal phase notes — not for commit, owner's eyes only
+docs/
