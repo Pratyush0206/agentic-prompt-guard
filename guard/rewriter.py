@@ -9,11 +9,35 @@ Uses the LLM when available; otherwise falls back to deterministic,
 per-threat heuristic rules.
 """
 
+import re
 from typing import Optional
 
 from .llm import OllamaClient
 from .schemas import DetectorVerdict, RewriteResult, RewriteStatus, ThreatType
 
+# P2-6: boundary at which the "leading verb phrase + subject" (the user's
+# core task) is cut off — a clause punctuation mark, or a qualifier
+# conjunction that typically introduces the non-compliant part of the
+# request ("...and avoid mentioning it's unapproved", "...even if evidence
+# is limited"). Falls back to the first ~12 words when no such boundary is
+# found (see _extract_task).
+_TASK_BOUNDARY_RE = re.compile(
+    r"^(.{8,100}?)(?:[,;:]|\s+\b(?:while|even though|even if|but|without|"
+    r"avoiding|and\s+avoid|that\s+has\s+not|outside\s+of)\b)",
+    re.IGNORECASE,
+)
+
+
+def _extract_task(prompt: str) -> str:
+    """Extract the leading verb phrase + subject — the user's core task —
+    from *prompt*, so a rewrite can preserve what was actually asked
+    instead of discarding it for generic boilerplate (P2-6).
+    """
+    stripped = prompt.strip().rstrip(". ")
+    m = _TASK_BOUNDARY_RE.match(stripped)
+    if m:
+        return m.group(1).strip()
+    return " ".join(stripped.split()[:12]).rstrip(",;: ")
 
 _SYSTEM = """You rewrite risky prompts for a regulated pharma agent into safe,
 compliant versions.
@@ -340,11 +364,21 @@ class SafeRewriter:
         )
 
         if primary_threat is not None:
-            rewritten = (
-                f"{_REWRITE_TEMPLATES[primary_threat]} "
-                "For safety, restate any necessary context using only "
-                "compliant, de-identified details."
-            )
+            # Preserve the user's actual task (leading verb phrase +
+            # subject) and apply the template's constraint text to it,
+            # rather than discarding the task for generic boilerplate.
+            # Only fall back to the boilerplate template itself when no
+            # usable task phrase can be extracted (P2-6).
+            task = _extract_task(prompt)
+            constraint = _CONSTRAINTS.get(primary_threat, (None, None))[0]
+            if constraint and len(task) >= 8:
+                rewritten = f"{task}, {constraint}."
+            else:
+                rewritten = (
+                    f"{_REWRITE_TEMPLATES[primary_threat]} "
+                    "For safety, restate any necessary context using only "
+                    "compliant, de-identified details."
+                )
         else:
             # Generic fallback for threats where appending constraints is
             # sufficient to preserve the benign task.
