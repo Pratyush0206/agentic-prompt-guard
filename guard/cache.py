@@ -73,17 +73,30 @@ def normalize_for_cache(prompt: str) -> str:
     return _MULTI_SPACE.sub(" ", prompt.lower().strip())
 
 
-def cache_key(prompt: str) -> str:
-    """Return the Redis key for *prompt*.
+# Bump when a pipeline change affects cached results' validity (e.g. a
+# detection rule change) so old entries are naturally invalidated by key
+# mismatch rather than needing an explicit flush.
+PIPELINE_VERSION = "v2"
 
-    Format: ``"apg:v1:<sha256_hex>"``
-    The SHA-256 is computed over the *normalised* prompt (UTF-8 encoded)
-    so that semantically identical prompts with different casing or spacing
-    map to the same key.
+
+def make_key(prompt: str, execute: bool, version: str) -> str:
+    """Return the single cache key used by *both* the Redis and in-process
+    LRU caches, so a prompt screened under one config/execute mode never
+    collides with — or masks — a result produced under a different one.
+
+    Format: ``"apg:<sha256_hex>"``. The SHA-256 is computed over
+    ``version:execute:normalised_prompt`` so that:
+      * semantically identical prompts (same casing/spacing) share a key,
+      * a prompt checked with ``execute=False`` never hits a cache entry
+        produced with ``execute=True`` (or vice versa) — a cached result
+        with no sandbox output must not be served for an execute request,
+      * changing ``version`` (``PIPELINE_VERSION`` plus a hash of the
+        active pipeline config — see ``PromptGuard.__init__``) invalidates
+        every previously cached entry at once.
     """
     normalised = normalize_for_cache(prompt)
-    digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()
-    return f"apg:v1:{digest}"
+    digest = hashlib.sha256(f"{version}:{execute}:{normalised}".encode("utf-8")).hexdigest()
+    return f"apg:{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -115,18 +128,22 @@ class RedisCache:
 
     # ── Public interface ──────────────────────────────────────────────────
 
-    def get(self, prompt: str):
-        """Return the cached :class:`~guard.schemas.GuardResult` for *prompt*, or ``None``.
+    def get(self, prompt: str, execute: bool, version: str):
+        """Return the cached :class:`~guard.schemas.GuardResult` for
+        *prompt*/*execute*/*version*, or ``None``.
 
         Appends ``"cache=redis_hit"`` to the returned result's ``audit_log``
-        so callers can distinguish cached results from live ones.
+        so callers can distinguish cached results from live ones. The
+        result is freshly deserialised from JSON on every call, so it is
+        never the same Python object twice — safe for a caller to mutate
+        without affecting what a later call returns.
 
         Never raises — any Redis error returns ``None`` and logs a WARNING.
         """
         # Import inside method to avoid circular import at module level.
         from .schemas import GuardResult  # noqa: PLC0415
 
-        key = cache_key(prompt)
+        key = make_key(prompt, execute, version)
         try:
             raw = self._client.get(key)
         except Exception as exc:  # noqa: BLE001
@@ -149,12 +166,12 @@ class RedisCache:
             log.warning("guard.cache — failed to deserialise cached result: %s", exc)
             return None
 
-    def set(self, prompt: str, result) -> None:
+    def set(self, prompt: str, result, execute: bool, version: str) -> None:
         """Serialise *result* and store it in Redis with the configured TTL.
 
         Never raises — any Redis error is logged as a WARNING and swallowed.
         """
-        key = cache_key(prompt)
+        key = make_key(prompt, execute, version)
         try:
             payload = result.model_dump_json()
             self._client.setex(key, self._ttl, payload)
